@@ -14,6 +14,8 @@ Signers: --signer, else 1Password's op-ssh-sign if installed, else ssh-keygen th
 signed as a private copy named `payload` in a fresh temp directory, so the signature name never depends on the
 signer's naming rule (op-ssh-sign replaces the last extension: manifest.json -> manifest.sig; ssh-keygen appends).
 A signature covers the file's bytes and the namespace, not its name, so FILE.sig is the canonical name to keep.
+Exit codes: 0 all good; 1 verify found a BAD signature; 2 refused (bad input, missing file, signer failure; argparse
+usage errors also exit 2).
 """
 import argparse, os, re, shutil, subprocess, sys, tempfile
 
@@ -45,6 +47,7 @@ def default_signer():
 
 
 def read_pub(path):
+    need(os.path.isfile(path), "no public key file %s" % path)
     with open(path) as f:
         parts = f.read().split()
     need(len(parts) >= 2 and (parts[0].startswith("ssh-") or parts[0].startswith("sk-") or parts[0].startswith("ecdsa-")),
@@ -77,43 +80,58 @@ def verify_one(allowed, principal, namespace, path, sig):
 
 def cmd_sign(a):
     need(NS_RE.match(a.namespace), "bad namespace %r" % a.namespace)
+    need(os.path.isfile(a.pub), "no public key file %s" % a.pub)
     read_pub(a.pub)
+    fp = fingerprint(a.pub)
     signer = a.signer or default_signer()
     for f in a.files:
         need(os.path.isfile(f), "no such file %s" % f)
         need(not os.path.lexists(f + ".sig"), "%s.sig exists: refusing to overwrite a signature" % f)
     done = []
-    for f in a.files:
-        tmp = tempfile.mkdtemp(prefix="release-sig.")
-        try:
-            payload = os.path.join(tmp, "payload")
-            shutil.copyfile(f, payload)
-            os.chmod(payload, 0o600)
-            p = subprocess.run([signer, "-Y", "sign", "-n", a.namespace, "-f", os.path.abspath(a.pub), payload],
-                               capture_output=True, text=True)
-            produced = os.path.join(tmp, "payload.sig")
-            need(p.returncode == 0 and os.path.isfile(produced),
-                 "signer failed on %s (rc %d): %s" % (f, p.returncode, (p.stderr or p.stdout).strip()[:400]))
-            # Check the new signature against the requested public key before keeping it.
-            allowed = os.path.join(tmp, "allowed_signers")
-            with open(allowed, "w") as fh:
-                fh.write(allowed_line("signer-self-check", a.namespace, a.pub) + "\n")
-            ok, out = verify_one(allowed, "signer-self-check", a.namespace, f, produced)
-            need(ok, "the new signature of %s does not verify with %s: %s" % (f, a.pub, out))
-            fd = os.open(f + ".sig", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-            with os.fdopen(fd, "wb") as out_f, open(produced, "rb") as in_f:
-                out_f.write(in_f.read())
+    try:
+        for f in a.files:
+            sign_one(a, signer, f)
             done.append(f + ".sig")
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-    print("signed %d file(s) with %s (%s) in namespace %s:" % (len(done), a.pub, fingerprint(a.pub), a.namespace))
+    except (Refused, OSError):
+        if done:  # never leave the human guessing which signatures exist
+            print("kept (verified): %s; fix the failure, then sign only the remaining files" % ", ".join(done), file=sys.stderr)
+        raise
+    print("signed %d file(s) with %s (%s) in namespace %s:" % (len(done), a.pub, fp, a.namespace))
     for d in done:
         print("  " + d)
     return 0
 
 
+def sign_one(a, signer, f):
+    tmp = tempfile.mkdtemp(prefix="release-sig.")
+    try:
+        payload = os.path.join(tmp, "payload")
+        shutil.copyfile(f, payload)
+        os.chmod(payload, 0o600)
+        p = subprocess.run([signer, "-Y", "sign", "-n", a.namespace, "-f", os.path.abspath(a.pub), payload],
+                           capture_output=True, text=True)
+        produced = os.path.join(tmp, "payload.sig")
+        need(p.returncode == 0 and os.path.isfile(produced),
+             "signer failed on %s (rc %d): %s" % (f, p.returncode, (p.stderr or p.stdout).strip()[:400]))
+        # Check the new signature against the requested public key before keeping it.
+        allowed = os.path.join(tmp, "allowed_signers")
+        with open(allowed, "w") as fh:
+            fh.write(allowed_line("signer-self-check", a.namespace, a.pub) + "\n")
+        ok, out = verify_one(allowed, "signer-self-check", a.namespace, f, produced)
+        need(ok, "the new signature of %s does not verify with %s: %s" % (f, a.pub, out))
+        fd = os.open(f + ".sig", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "wb") as out_f, open(produced, "rb") as in_f:
+            out_f.write(in_f.read())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def cmd_verify(a):
     need(os.path.isfile(a.allowed_signers), "no allowed_signers file %s" % a.allowed_signers)
+    need(PRINCIPAL_RE.match(a.principal), "bad principal %r" % a.principal)
+    need(NS_RE.match(a.namespace), "bad namespace %r" % a.namespace)
+    for f in a.files:
+        need(os.path.isfile(f), "no such file %s" % f)
     bad = 0
     for f in a.files:
         ok, out = verify_one(a.allowed_signers, a.principal, a.namespace, f, f + ".sig")
@@ -152,7 +170,7 @@ def main(argv):
             return 0
         print(fingerprint(a.pub))
         return 0
-    except Refused as e:
+    except (Refused, OSError) as e:  # exit 2 = refused (bad input, missing file, signer failure); 1 = a BAD signature
         print("release-sig: REFUSED: %s" % e, file=sys.stderr)
         return 2
 

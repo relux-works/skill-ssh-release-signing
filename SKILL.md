@@ -49,6 +49,9 @@ ssh-keygen -Y sign -f release-key.pub -n NAMESPACE manifest.json
 ssh-keygen -Y sign -f release-key.pub -n NAMESPACE SHA256SUMS
 ```
 
+**1Password on Linux:** the same commands with `/opt/1Password/op-ssh-sign`, or the agent socket
+`export SSH_AUTH_SOCK="$HOME/.1password/agent.sock"`.
+
 **Any other agent** (key loaded with `ssh-add`): the same `ssh-keygen -Y sign -f KEY.pub ...` with that agent's
 `SSH_AUTH_SOCK`.
 
@@ -59,7 +62,7 @@ the private key file to "fix" it.
 ## The wrapper: scripts/release-sig
 
 ```sh
-RS=/path/to/skill-ssh-release-signing/scripts/release-sig
+RS="python3 -I /path/to/skill-ssh-release-signing/scripts/release-sig"
 $RS fingerprint release-key.pub                       # read it aloud and compare with the human's record
 $RS sign --pub release-key.pub --namespace NAMESPACE manifest.json SHA256SUMS
 $RS allowed-signers --principal PRINCIPAL --namespace NAMESPACE --pub release-key.pub > allowed_signers
@@ -73,6 +76,13 @@ installed, else ssh-keygen through `SSH_AUTH_SOCK`. `sign` handles each file lik
 - it writes exactly `FILE.sig`, and never over an existing one.
 
 `verify` exits 0 only when every `FILE.sig` reads `Good "NAMESPACE" signature for PRINCIPAL with ...`.
+
+Exit codes: 0 all good; 1 `verify` found a BAD signature; 2 refused (bad input, a missing file, a signer failure).
+If `sign` fails on a later file (for example a cancelled Touch ID), the signatures already made are kept and
+verified, stderr lists them, and you sign only the remaining files.
+
+`sign` copies each file into `TMPDIR` before signing. For a very large archive, sign its `SHA256SUMS` instead (the
+usual release pattern) or point `TMPDIR` at a disk with room.
 
 ## Verify by hand
 
@@ -90,7 +100,7 @@ ssh-keygen -Y verify -f allowed_signers -I PRINCIPAL -n NAMESPACE -s manifest.js
 1. The agent builds the files and their digests, and writes the public key next to them with a SIGN-ME note: the
    files, the namespace, the commands above and the expected fingerprint.
 2. The human checks the fingerprint, signs, and tells the agent.
-3. The agent verifies each signature with the pinned principal and namespace, renames `manifest.sig` to
-   `manifest.json.sig` if op-ssh-sign was used, and records the digests of the files and the signatures.
+3. The agent renames `manifest.sig` to `manifest.json.sig` if op-ssh-sign was used, then verifies each signature
+   with the pinned principal and namespace, and records the digests of the files and the signatures.
 4. Installers consume `allowed_signers`, the principal (signer id) and the `.sig` files: never a key from the release
    itself.

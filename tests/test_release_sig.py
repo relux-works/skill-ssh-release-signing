@@ -1,5 +1,5 @@
 """Tests for scripts/release-sig with throwaway keys made in a scratch dir. Needs OpenSSH ssh-keygen and ssh-agent."""
-import importlib.machinery, importlib.util, os, shutil, subprocess, tempfile, unittest
+import contextlib, importlib.machinery, importlib.util, io, os, shutil, subprocess, tempfile, time, unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "scripts", "release-sig")
@@ -75,9 +75,9 @@ class Sign(Base):
         self.assertFalse(os.path.exists(os.path.join(self.d, "a.tar.sig")))
         self.assertEqual(self.verify(), 0)
 
-    # Claim: a signer that signs with a DIFFERENT key than --pub is refused before any FILE.sig is written.
+    # Claim: a signer that signs with a DIFFERENT key than --pub fails the self-check on the FIRST file, so no FILE.sig
+    # is written at all.
     def test_wrong_key_refused(self):
-        import contextlib, io
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             self.assertEqual(self.sign(self.other), 2)
@@ -93,16 +93,56 @@ class Sign(Base):
             self.assertEqual(f.read(), "old")
         self.assertFalse(os.path.exists(self.files[1] + ".sig"))
 
+    # Claim: if the signer fails on the SECOND file (a cancelled Touch ID), the first signature is kept and verifies, the
+    # second does not exist, the run exits 2, and stderr names what was kept.
+    def test_partial_failure_reports_kept(self):
+        counter = os.path.join(self.d, "count")
+        flaky = os.path.join(self.d, "flaky-signer")
+        with open(flaky, "w") as f:
+            f.write('#!/bin/sh\nn=$(cat %s 2>/dev/null || echo 0); n=$((n+1)); echo $n > %s\n'
+                    '[ "$n" -ge 2 ] && { echo "cancelled" >&2; exit 1; }\nexec %s "$@"\n' % (counter, counter, self.fake))
+        os.chmod(flaky, 0o755)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.sign(self.key, files=self.files[:2], signer=flaky), 2)
+        self.assertIn("kept (verified): %s.sig" % self.files[0], err.getvalue())
+        self.assertFalse(os.path.exists(self.files[1] + ".sig"))
+        self.assertEqual(self.verify(files=self.files[:1]), 0)
+
+    # Claim: the fake signer really behaves like op-ssh-sign for naming (x.json -> x.sig, not x.json.sig), so the test
+    # above exercises that rule; this is the control for the fake itself.
+    def test_fake_signer_naming_control(self):
+        x = os.path.join(self.d, "x.json")
+        with open(x, "w") as f:
+            f.write("{}")
+        env = dict(os.environ, FAKE_SIGN_KEY=self.key)
+        subprocess.run([self.fake, "-Y", "sign", "-n", NS, "-f", self.key + ".pub", x], env=env, check=True)
+        self.assertTrue(os.path.exists(os.path.join(self.d, "x.sig")))
+        self.assertFalse(os.path.exists(x + ".sig"))
+
+    # Claim: a missing --pub file or a missing data file is a refusal (exit 2) with a message, never a traceback.
+    def test_missing_inputs_refused(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.sign(self.key, pub=os.path.join(self.d, "nope.pub")), 2)
+            self.assertEqual(self.verify(files=[os.path.join(self.d, "typo.json")]), 2)
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertIn("REFUSED", err.getvalue())
+
     # Claim: the plain ssh-keygen path works through an ssh-agent that holds the key (the private key file is not
     # passed to the tool), as on a host without 1Password.
     def test_agent_path(self):
-        sock = os.path.join(self.d, "agent.sock")
-        agent = subprocess.Popen(["ssh-agent", "-D", "-a", sock], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        short = tempfile.mkdtemp(dir="/tmp")  # unix socket paths are limited to about 104 bytes on macOS
+        self.addCleanup(shutil.rmtree, short, True)
+        sock = os.path.join(short, "a.sock")
+        agent = subprocess.Popen(["ssh-agent", "-D", "-a", sock], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
             for _ in range(50):
                 if os.path.exists(sock):
                     break
-                subprocess.run(["sleep", "0.1"])
+                time.sleep(0.1)
+            else:
+                self.fail("ssh-agent did not create its socket %s" % sock)
             env = dict(os.environ, SSH_AUTH_SOCK=sock)
             subprocess.run(["ssh-add", "-q", self.key], env=env, check=True, capture_output=True)
             p = subprocess.run(["python3", "-I", TOOL, "sign", "--pub", self.key + ".pub", "--namespace", NS,

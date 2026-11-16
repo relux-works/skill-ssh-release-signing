@@ -20,8 +20,9 @@ jobs:
         run: python3 -I -c "import sys; print(sys.version)"; ssh -V
       - name: Unit tests
         run: sh tests/run.sh
-      - name: CLI smoke (help, refusal exit code)
+      - name: CLI smoke (help; a bad principal and a non-key file are both refused with exit 2)
         run: |
           python3 -I scripts/release-sig --help >/dev/null
-          set +e; python3 -I scripts/release-sig allowed-signers --principal "bad principal" --namespace x --pub README.md; rc=$?; set -e
-          test "$rc" = 2
+          set +e; python3 -I scripts/release-sig allowed-signers --principal "bad principal" --namespace x --pub README.md; rc1=$?
+          python3 -I scripts/release-sig allowed-signers --principal good --namespace x --pub README.md; rc2=$?; set -e
+          test "$rc1" = 2 && test "$rc2" = 2
