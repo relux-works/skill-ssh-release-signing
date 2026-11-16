@@ -62,11 +62,11 @@ the private key file to "fix" it.
 ## The wrapper: scripts/release-sig
 
 ```sh
-RS="python3 -I /path/to/skill-ssh-release-signing/scripts/release-sig"
-$RS fingerprint release-key.pub                       # read it aloud and compare with the human's record
-$RS sign --pub release-key.pub --namespace NAMESPACE manifest.json SHA256SUMS
-$RS allowed-signers --principal PRINCIPAL --namespace NAMESPACE --pub release-key.pub > allowed_signers
-$RS verify --allowed-signers allowed_signers --principal PRINCIPAL --namespace NAMESPACE manifest.json SHA256SUMS
+rs() { python3 -I /path/to/skill-ssh-release-signing/scripts/release-sig "$@"; }   # a function works in sh, bash and zsh
+rs fingerprint release-key.pub                       # read it aloud and compare with the human's record
+rs sign --pub release-key.pub --namespace NAMESPACE manifest.json SHA256SUMS
+rs allowed-signers --principal PRINCIPAL --namespace NAMESPACE --pub release-key.pub > allowed_signers
+rs verify --allowed-signers allowed_signers --principal PRINCIPAL --namespace NAMESPACE manifest.json SHA256SUMS
 ```
 
 The human runs `sign`, which asks for Touch ID once per file. The signer is `--signer`, else op-ssh-sign if

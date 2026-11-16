@@ -6,5 +6,5 @@ scratch=$(mktemp -d "${TMPDIR:-/tmp}/release-sig-tests.XXXXXX")
 scratch=$(cd "$scratch" && pwd -P)
 trap 'rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/home" "$scratch/config" "$scratch/tmp"
-PYTHONDONTWRITEBYTECODE=1 HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/config" TMPDIR="$scratch/tmp" \
-  python3 -I -m unittest discover -s "$here/tests" -p 'test_*.py' -v
+HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/config" TMPDIR="$scratch/tmp" \
+  python3 -I -B -m unittest discover -s "$here/tests" -p 'test_*.py' -v

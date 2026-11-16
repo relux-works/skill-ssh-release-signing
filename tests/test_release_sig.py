@@ -1,5 +1,5 @@
 """Tests for scripts/release-sig with throwaway keys made in a scratch dir. Needs OpenSSH ssh-keygen and ssh-agent."""
-import contextlib, importlib.machinery, importlib.util, io, os, shutil, subprocess, tempfile, time, unittest
+import contextlib, importlib.machinery, importlib.util, io, os, shlex, shutil, subprocess, tempfile, time, unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "scripts", "release-sig")
@@ -99,8 +99,9 @@ class Sign(Base):
         counter = os.path.join(self.d, "count")
         flaky = os.path.join(self.d, "flaky-signer")
         with open(flaky, "w") as f:
+            q = shlex.quote
             f.write('#!/bin/sh\nn=$(cat %s 2>/dev/null || echo 0); n=$((n+1)); echo $n > %s\n'
-                    '[ "$n" -ge 2 ] && { echo "cancelled" >&2; exit 1; }\nexec %s "$@"\n' % (counter, counter, self.fake))
+                    '[ "$n" -ge 2 ] && { echo "cancelled" >&2; exit 1; }\nexec %s "$@"\n' % (q(counter), q(counter), q(self.fake)))
         os.chmod(flaky, 0o755)
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
@@ -109,8 +110,8 @@ class Sign(Base):
         self.assertFalse(os.path.exists(self.files[1] + ".sig"))
         self.assertEqual(self.verify(files=self.files[:1]), 0)
 
-    # Claim: the fake signer really behaves like op-ssh-sign for naming (x.json -> x.sig, not x.json.sig), so the test
-    # above exercises that rule; this is the control for the fake itself.
+    # Claim: the fake signer really behaves like op-ssh-sign for naming (x.json -> x.sig, not x.json.sig): the control
+    # for the fake itself, so the wrapper tests that use it run against that naming rule.
     def test_fake_signer_naming_control(self):
         x = os.path.join(self.d, "x.json")
         with open(x, "w") as f:
@@ -142,7 +143,8 @@ class Sign(Base):
                     break
                 time.sleep(0.1)
             else:
-                self.fail("ssh-agent did not create its socket %s" % sock)
+                agent.terminate()
+                self.fail("ssh-agent did not create its socket %s: %s" % (sock, agent.communicate()[1].decode(errors="replace")))
             env = dict(os.environ, SSH_AUTH_SOCK=sock)
             subprocess.run(["ssh-add", "-q", self.key], env=env, check=True, capture_output=True)
             p = subprocess.run(["python3", "-I", TOOL, "sign", "--pub", self.key + ".pub", "--namespace", NS,
