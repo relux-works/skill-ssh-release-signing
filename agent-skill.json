@@ -1,0 +1,12 @@
+{
+  "schema_version": 7,
+  "capabilities": {
+    "network": []
+  },
+  "commands": {
+    "release-sig": {
+      "type": "script",
+      "unix_path": "scripts/release-sig"
+    }
+  }
+}

@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""release-sig: sign and verify release files with an SSH key (ssh-keygen -Y), including keys held in 1Password.
+
+  release-sig sign --pub KEY.pub --namespace NS [--signer PATH] FILE...
+        writes FILE.sig for each FILE (never overwrites); the private key stays in the agent or in 1Password
+  release-sig verify --allowed-signers FILE --principal P --namespace NS FILE...
+        checks FILE.sig for each FILE; exit 0 only if every one is "Good" for exactly that principal and namespace
+  release-sig allowed-signers --principal P --namespace NS --pub KEY.pub
+        prints the one allowed_signers line for that key
+  release-sig fingerprint KEY.pub
+        prints the key's SHA256 fingerprint
+
+Signers: --signer, else 1Password's op-ssh-sign if installed, else ssh-keygen through SSH_AUTH_SOCK. Each file is
+signed as a private copy named `payload` in a fresh temp directory, so the signature name never depends on the
+signer's naming rule (op-ssh-sign replaces the last extension: manifest.json -> manifest.sig; ssh-keygen appends).
+A signature covers the file's bytes and the namespace, not its name, so FILE.sig is the canonical name to keep.
+"""
+import argparse, os, re, shutil, subprocess, sys, tempfile
+
+OP_SIGNERS = ("/Applications/1Password.app/Contents/MacOS/op-ssh-sign", "/opt/1Password/op-ssh-sign")
+NS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,100}$")
+PRINCIPAL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,200}$")
+
+
+class Refused(Exception):
+    pass
+
+
+def need(cond, why):
+    if not cond:
+        raise Refused(why)
+
+
+def ssh_keygen():
+    p = shutil.which("ssh-keygen")
+    need(p, "ssh-keygen not found")
+    return p
+
+
+def default_signer():
+    for p in OP_SIGNERS:
+        if os.access(p, os.X_OK):
+            return p
+    return ssh_keygen()
+
+
+def read_pub(path):
+    with open(path) as f:
+        parts = f.read().split()
+    need(len(parts) >= 2 and (parts[0].startswith("ssh-") or parts[0].startswith("sk-") or parts[0].startswith("ecdsa-")),
+         "%s is not an OpenSSH public key" % path)
+    return parts[0], parts[1]
+
+
+def allowed_line(principal, namespace, pub):
+    need(PRINCIPAL_RE.match(principal), "bad principal %r" % principal)
+    need(NS_RE.match(namespace), "bad namespace %r" % namespace)
+    kt, key = read_pub(pub)
+    return '%s namespaces="%s" %s %s' % (principal, namespace, kt, key)
+
+
+def fingerprint(pub):
+    p = subprocess.run([ssh_keygen(), "-l", "-E", "sha256", "-f", pub], capture_output=True, text=True)
+    need(p.returncode == 0, "ssh-keygen -l failed: %s" % p.stderr.strip())
+    return p.stdout.split()[1]
+
+
+def verify_one(allowed, principal, namespace, path, sig):
+    need(os.path.isfile(sig), "missing signature %s" % sig)
+    with open(path, "rb") as data:
+        p = subprocess.run([ssh_keygen(), "-Y", "verify", "-f", allowed, "-I", principal, "-n", namespace, "-s", sig],
+                           stdin=data, capture_output=True, text=True)
+    out = (p.stdout + p.stderr).strip()
+    good = 'Good "%s" signature for %s with ' % (namespace, principal)
+    return p.returncode == 0 and out.startswith(good), out
+
+
+def cmd_sign(a):
+    need(NS_RE.match(a.namespace), "bad namespace %r" % a.namespace)
+    read_pub(a.pub)
+    signer = a.signer or default_signer()
+    for f in a.files:
+        need(os.path.isfile(f), "no such file %s" % f)
+        need(not os.path.lexists(f + ".sig"), "%s.sig exists: refusing to overwrite a signature" % f)
+    done = []
+    for f in a.files:
+        tmp = tempfile.mkdtemp(prefix="release-sig.")
+        try:
+            payload = os.path.join(tmp, "payload")
+            shutil.copyfile(f, payload)
+            os.chmod(payload, 0o600)
+            p = subprocess.run([signer, "-Y", "sign", "-n", a.namespace, "-f", os.path.abspath(a.pub), payload],
+                               capture_output=True, text=True)
+            produced = os.path.join(tmp, "payload.sig")
+            need(p.returncode == 0 and os.path.isfile(produced),
+                 "signer failed on %s (rc %d): %s" % (f, p.returncode, (p.stderr or p.stdout).strip()[:400]))
+            # Check the new signature against the requested public key before keeping it.
+            allowed = os.path.join(tmp, "allowed_signers")
+            with open(allowed, "w") as fh:
+                fh.write(allowed_line("signer-self-check", a.namespace, a.pub) + "\n")
+            ok, out = verify_one(allowed, "signer-self-check", a.namespace, f, produced)
+            need(ok, "the new signature of %s does not verify with %s: %s" % (f, a.pub, out))
+            fd = os.open(f + ".sig", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, "wb") as out_f, open(produced, "rb") as in_f:
+                out_f.write(in_f.read())
+            done.append(f + ".sig")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    print("signed %d file(s) with %s (%s) in namespace %s:" % (len(done), a.pub, fingerprint(a.pub), a.namespace))
+    for d in done:
+        print("  " + d)
+    return 0
+
+
+def cmd_verify(a):
+    need(os.path.isfile(a.allowed_signers), "no allowed_signers file %s" % a.allowed_signers)
+    bad = 0
+    for f in a.files:
+        ok, out = verify_one(a.allowed_signers, a.principal, a.namespace, f, f + ".sig")
+        print("%s %s: %s" % ("GOOD" if ok else "BAD", f, out.splitlines()[0] if out else "(no output)"))
+        bad += not ok
+    return 1 if bad else 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="release-sig", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("sign")
+    s.add_argument("--pub", required=True)
+    s.add_argument("--namespace", required=True)
+    s.add_argument("--signer")
+    s.add_argument("files", nargs="+")
+    v = sub.add_parser("verify")
+    v.add_argument("--allowed-signers", required=True)
+    v.add_argument("--principal", required=True)
+    v.add_argument("--namespace", required=True)
+    v.add_argument("files", nargs="+")
+    l = sub.add_parser("allowed-signers")
+    l.add_argument("--principal", required=True)
+    l.add_argument("--namespace", required=True)
+    l.add_argument("--pub", required=True)
+    fp = sub.add_parser("fingerprint")
+    fp.add_argument("pub")
+    a = ap.parse_args(argv[1:])
+    try:
+        if a.cmd == "sign":
+            return cmd_sign(a)
+        if a.cmd == "verify":
+            return cmd_verify(a)
+        if a.cmd == "allowed-signers":
+            print(allowed_line(a.principal, a.namespace, a.pub))
+            return 0
+        print(fingerprint(a.pub))
+        return 0
+    except Refused as e:
+        print("release-sig: REFUSED: %s" % e, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
